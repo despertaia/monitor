@@ -1,0 +1,72 @@
+# Alarme do servidor da Desperta.IA (VPS da Hostinger): testa a biblioteca da Banca e a
+# Controladoria a cada 5 minutos, de fora da Hostinger. Avisa no celular (ntfy) só quando
+# muda: quando cai e quando volta. Run vermelho = fora do ar; o GitHub também manda e-mail.
+# Criado em 23/10/2026, depois de o servidor congelar e ninguém saber por mais de uma hora.
+name: Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      teste:
+        description: 'Mandar um aviso de teste para o celular'
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  checar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Testar os serviços
+        id: teste
+        run: |
+          falhas=""
+          checar() {
+            nome="$1"; url="$2"; codigo=000
+            # Três tentativas com 15 s entre elas: um soluço de rede não vira alarme.
+            for i in 1 2 3; do
+              codigo=$(curl -s -o /dev/null -m 20 -w "%{http_code}" "$url" || true)
+              case "$codigo" in 2??|3??) echo "ok    $nome ($codigo)"; return 0;; esac
+              sleep 15
+            done
+            echo "FORA  $nome ($codigo)"
+            falhas="$falhas, $nome"
+          }
+          checar "Biblioteca da Banca" "https://banca.despertaia.com.br/v1/catalog"
+          checar "Controladoria" "https://processos.despertaia.com.br/"
+          echo "falhas=${falhas#, }" >> "$GITHUB_OUTPUT"
+
+      - name: Avisar no celular quando muda
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOPICO: ${{ secrets.NTFY_TOPICO }}
+          FALHAS: ${{ steps.teste.outputs.falhas }}
+          TESTE: ${{ inputs.teste }}
+        run: |
+          # O run anterior diz o estado de antes: falhou = já estava fora (já avisamos).
+          anterior=$(gh run list -R "$GITHUB_REPOSITORY" --workflow monitor.yml --status completed --limit 1 \
+            --json conclusion --jq '.[0].conclusion // "success"')
+          avisar() { curl -s -H "Title: $1" -H "Priority: $2" -H "Tags: $3" -d "$4" "https://ntfy.sh/$TOPICO" > /dev/null; }
+          if [ "$TESTE" = "true" ]; then
+            avisar "Teste do alarme" default white_check_mark "O alarme do servidor da Desperta.IA está funcionando."
+          fi
+          if [ -n "$FALHAS" ] && [ "$anterior" != "failure" ]; then
+            avisar "Servidor fora do ar" urgent rotating_light "Não responde: $FALHAS. Abra o painel da Hostinger: hpanel.hostinger.com"
+          fi
+          if [ -z "$FALHAS" ] && [ "$anterior" = "failure" ]; then
+            avisar "Servidor voltou" default white_check_mark "Biblioteca da Banca e Controladoria respondendo de novo."
+          fi
+          if [ -n "$FALHAS" ]; then
+            echo "::error::Fora do ar: $FALHAS"
+            exit 1
+          fi
